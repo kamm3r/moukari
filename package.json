@@ -1,54 +1,33 @@
 {
-	"name": "moukari",
-	"private": true,
-	"version": "0.0.1",
-	"type": "module",
-	"scripts": {
-		"dev": "vite dev",
-		"build": "vite build",
-		"preview": "vite preview",
-		"prepare": "svelte-kit sync || echo ''",
-		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-		"format": "prettier --write .",
-		"lint": "prettier --check . && eslint .",
-		"test:unit": "vitest",
-		"test": "npm run test:unit -- --run"
-	},
-	"devDependencies": {
-		"@eslint/compat": "^1.4.0",
-		"@eslint/js": "^9.39.1",
-		"@internationalized/date": "^3.10.0",
-		"@lucide/svelte": "^0.544.0",
-		"@sveltejs/adapter-static": "^3.0.10",
-		"@sveltejs/kit": "^2.48.5",
-		"@sveltejs/vite-plugin-svelte": "^6.2.1",
-		"@tailwindcss/vite": "^4.1.17",
-		"@types/node": "^22",
-		"@vitest/browser-playwright": "^4.0.10",
-		"bits-ui": "^2.14.4",
-		"clsx": "^2.1.1",
-		"eslint": "^9.39.1",
-		"eslint-config-prettier": "^10.1.8",
-		"eslint-plugin-svelte": "^3.13.0",
-		"globals": "^16.5.0",
-		"playwright": "^1.56.1",
-		"prettier": "^3.6.2",
-		"prettier-plugin-svelte": "^3.4.0",
-		"prettier-plugin-tailwindcss": "^0.7.1",
-		"svelte": "^5.43.8",
-		"svelte-check": "^4.3.4",
-		"tailwind-merge": "^3.4.0",
-		"tailwind-variants": "^3.2.2",
-		"tailwindcss": "^4.1.17",
-		"tw-animate-css": "^1.4.0",
-		"typescript": "^5.9.3",
-		"typescript-eslint": "^8.47.0",
-		"vite": "^7.2.2",
-		"vitest": "^4.0.10",
-		"vitest-browser-svelte": "^2.0.1"
-	},
-	"dependencies": {
-		"@techstark/opencv-js": "4.12.0-release.1"
-	}
+  "name": "hammer-throw-analyzer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "^4.10.0-release.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zustand": "^4.5.5",
+    "lucide-react": "^0.441.0",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^2.5.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.9",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.12",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.7",
+    "vitest": "^2.1.1"
+  }
 }
