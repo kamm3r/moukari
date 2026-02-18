@@ -1,24 +1,29 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { AlertCircle, Check, ChevronLeft, Loader2, Move } from 'lucide-react'
+import type { VideoMetadata, VideoWarning } from '@/hooks/use-video-metadata'
+import type {CircleDetectionResult} from '@/lib/circle-detector';
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   Card,
   CardContent,
-  CardHeader,
-  CardTitle,
   CardDescription,
   CardFooter,
+  CardHeader,
+  CardTitle,
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
-import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Label } from '@/components/ui/label'
-import { VideoMetadata, VideoWarning } from '@/hooks/use-video-metadata'
-import { detectThrowingCircle } from '@/lib/circle-detector'
-import { Loader2, AlertCircle, Check, ChevronLeft } from 'lucide-react'
+import {
+  
+  detectThrowingCircle,
+  preloadOpenCV
+} from '@/lib/circle-detector'
 
 interface CalibrationViewerProps {
   videoUrl: string
   metadata: VideoMetadata | null
-  warnings: VideoWarning[]
+  warnings: Array<VideoWarning>
   onComplete: (data: {
     circleCenter: { x: number; y: number }
     circleRadius: number
@@ -41,36 +46,52 @@ export function CalibrationViewer({
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const [isProcessing, setIsProcessing] = useState(true)
-  const [circleData, setCircleData] = useState<{
-    center: { x: number; y: number }
-    radius: number
+  const [detectionResult, setDetectionResult] =
+    useState<CircleDetectionResult | null>(null)
+  const [manualMode, setManualMode] = useState(false)
+  const [manualCenter, setManualCenter] = useState<{
+    x: number
+    y: number
   } | null>(null)
-  const [scaleFactor, setScaleFactor] = useState<number>(0)
+  const [manualRadius, setManualRadius] = useState(100)
 
-  // Auto-detect circle on load
+  const canvasWidth = Math.min(metadata?.width || 1280, 640)
+  const canvasHeight = Math.min(metadata?.height || 720, 360)
+
   useEffect(() => {
+    console.log('[CalibrationViewer] Starting circle detection effect...')
     let isCancelled = false
     const abortController = new AbortController()
 
     const detect = async () => {
-      if (!videoRef.current || !canvasRef.current) return
+      if (!videoRef.current || !canvasRef.current) {
+        console.error('[CalibrationViewer] Missing video or canvas ref')
+        return
+      }
 
       const video = videoRef.current
+      console.log(
+        '[CalibrationViewer] Video element ready, readyState:',
+        video.readyState,
+      )
 
       try {
-        // Wait for video to be ready with timeout
         if (video.readyState < 2) {
+          console.log('[CalibrationViewer] Waiting for video to load...')
           await new Promise<void>((resolve, reject) => {
             const timeout = setTimeout(() => {
+              console.error('[CalibrationViewer] Video load timeout')
               reject(new Error('Video load timeout'))
             }, 10000)
 
             const handleLoad = () => {
+              console.log('[CalibrationViewer] Video loaded')
               clearTimeout(timeout)
               resolve()
             }
 
             const handleError = () => {
+              console.error('[CalibrationViewer] Video load error')
               clearTimeout(timeout)
               reject(new Error('Failed to load video'))
             }
@@ -86,19 +107,20 @@ export function CalibrationViewer({
 
         if (isCancelled) return
 
-        // Seek to middle frame for best circle visibility
-        video.currentTime = video.duration / 2
+        const seekTime = video.duration / 2
+        console.log(`[CalibrationViewer] Seeking to ${seekTime}s`)
+        video.currentTime = seekTime
 
         await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            reject(new Error('Video seek timeout'))
-          }, 5000)
+          const timeout = setTimeout(
+            () => reject(new Error('Video seek timeout')),
+            5000,
+          )
 
           const handleSeek = () => {
             clearTimeout(timeout)
             resolve()
           }
-
           const handleError = () => {
             clearTimeout(timeout)
             reject(new Error('Failed to seek video'))
@@ -110,19 +132,38 @@ export function CalibrationViewer({
 
         if (isCancelled) return
 
-        const detected = await detectThrowingCircle(video, canvasRef.current)
+        console.log('[CalibrationViewer] Preloading OpenCV...')
+        await preloadOpenCV()
 
         if (isCancelled) return
 
-        if (detected) {
-          setCircleData(detected)
-          // Calculate scale factor: 2.135m is the diameter of a standard hammer throw circle
-          const pixelsPerMeter = (detected.radius * 2) / 2.135
-          setScaleFactor(pixelsPerMeter)
+        console.log('[CalibrationViewer] Starting circle detection...')
+        const detectionPromise = detectThrowingCircle(video, canvasRef.current)
+        const timeoutPromise = new Promise<null>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Circle detection timeout')),
+            15000,
+          ),
+        )
+        const result = await Promise.race([detectionPromise, timeoutPromise])
+
+        if (isCancelled) return
+
+        if (result) {
+          console.log('[CalibrationViewer] Circle detected:', result)
+          setDetectionResult(result)
+          setManualCenter(result.center)
+          setManualRadius(result.radius)
+        } else {
+          console.log(
+            '[CalibrationViewer] No circle detected, switching to manual mode',
+          )
+          setManualMode(true)
         }
       } catch (err) {
         if (!isCancelled) {
-          console.error('Circle detection error:', err)
+          console.error('[CalibrationViewer] Detection error:', err)
+          setManualMode(true)
         }
       } finally {
         if (!isCancelled) {
@@ -134,70 +175,108 @@ export function CalibrationViewer({
     detect()
 
     return () => {
+      console.log('[CalibrationViewer] Cleanup - cancelling detection')
       isCancelled = true
       abortController.abort()
     }
   }, [videoUrl])
 
-  // Draw circle overlay
   useEffect(() => {
-    if (!canvasRef.current || !circleData || !videoRef.current) return
+    if (!canvasRef.current || !videoRef.current) return
 
     const canvas = canvasRef.current
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // Clear and draw video frame
     ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
 
-    // Draw detected circle
-    ctx.strokeStyle = '#22c55e'
-    ctx.lineWidth = 3
-    ctx.beginPath()
-    ctx.arc(
-      circleData.center.x,
-      circleData.center.y,
-      circleData.radius,
-      0,
-      2 * Math.PI,
-    )
-    ctx.stroke()
+    const center =
+      manualMode && manualCenter ? manualCenter : detectionResult?.center
+    const radius = manualMode ? manualRadius : detectionResult?.radius
 
-    // Draw center point
-    ctx.fillStyle = '#22c55e'
-    ctx.beginPath()
-    ctx.arc(circleData.center.x, circleData.center.y, 5, 0, 2 * Math.PI)
-    ctx.fill()
-  }, [circleData])
+    if (center && radius) {
+      ctx.strokeStyle = manualMode ? '#f59e0b' : '#22c55e'
+      ctx.lineWidth = 3
+      ctx.beginPath()
+      ctx.arc(center.x, center.y, radius, 0, 2 * Math.PI)
+      ctx.stroke()
 
-  const handleAdjustRadius = useCallback(
-    (value: number | readonly number[]) => {
-      if (!circleData) return
-      const radius = Array.isArray(value) ? value[0] : value
-      setCircleData({ ...circleData, radius })
-      setScaleFactor((radius * 2) / 2.135)
+      ctx.fillStyle = manualMode ? '#f59e0b' : '#22c55e'
+      ctx.beginPath()
+      ctx.arc(center.x, center.y, 5, 0, 2 * Math.PI)
+      ctx.fill()
+    }
+  }, [detectionResult, manualCenter, manualRadius, manualMode])
+
+  const handleCanvasClick = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!manualMode) return
+      const canvas = canvasRef.current
+      if (!canvas) return
+
+      const rect = canvas.getBoundingClientRect()
+      const x = (e.clientX - rect.left) * (canvas.width / rect.width)
+      const y = (e.clientY - rect.top) * (canvas.height / rect.height)
+      setManualCenter({ x, y })
     },
-    [circleData],
+    [manualMode],
   )
 
+  const handleRadiusChange = useCallback(
+    (value: number | ReadonlyArray<number>) => {
+      const v = Array.isArray(value) ? value[0] : value
+      setManualRadius(v ?? 100)
+    },
+    [],
+  )
+
+  const getScaleFactor = useCallback(() => {
+    const radius = manualMode ? manualRadius : detectionResult?.radius
+    if (!radius) return 0
+    return (radius * 2) / 2.135
+  }, [manualMode, manualRadius, detectionResult])
+
   const handleComplete = useCallback(() => {
-    if (!circleData || scaleFactor === 0) return
+    const center =
+      manualMode && manualCenter ? manualCenter : detectionResult?.center
+    const radius = manualMode ? manualRadius : detectionResult?.radius
+    if (!center || !radius) return
 
     onComplete({
-      circleCenter: circleData.center,
-      circleRadius: circleData.radius,
-      scaleFactor,
+      circleCenter: center,
+      circleRadius: radius,
+      scaleFactor: (radius * 2) / 2.135,
     })
-  }, [circleData, scaleFactor, onComplete])
+  }, [manualMode, manualCenter, manualRadius, detectionResult, onComplete])
+
+  const confidenceBadge = detectionResult && !manualMode && (
+    <span
+      className={`text-xs px-2 py-1 rounded ${
+        detectionResult.confidence === 'high'
+          ? 'bg-green-100 text-green-800'
+          : detectionResult.confidence === 'medium'
+            ? 'bg-yellow-100 text-yellow-800'
+            : 'bg-red-100 text-red-800'
+      }`}
+    >
+      {detectionResult.confidence} confidence
+    </span>
+  )
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Calibration</CardTitle>
-        <CardDescription>
-          Verify the throwing circle detection. Adjust if needed for accurate
-          measurements.
-        </CardDescription>
+        <div className="flex items-center justify-between">
+          <div>
+            <CardTitle>Calibration</CardTitle>
+            <CardDescription>
+              {manualMode
+                ? 'Click on the video to position the circle center'
+                : 'Verify the throwing circle detection. Adjust if needed.'}
+            </CardDescription>
+          </div>
+          {confidenceBadge}
+        </div>
       </CardHeader>
 
       <CardContent className="space-y-4">
@@ -226,9 +305,10 @@ export function CalibrationViewer({
           />
           <canvas
             ref={canvasRef}
-            className="w-full rounded-lg border"
-            width={Math.min(metadata?.width || 1280, 854)}
-            height={Math.min(metadata?.height || 720, 480)}
+            className={`w-full rounded-lg border ${manualMode ? 'cursor-crosshair' : ''}`}
+            width={canvasWidth}
+            height={canvasHeight}
+            onClick={handleCanvasClick}
           />
           {isProcessing && (
             <div className="absolute inset-0 flex items-center justify-center bg-background/80 rounded-lg">
@@ -240,7 +320,7 @@ export function CalibrationViewer({
           )}
         </div>
 
-        {!isProcessing && circleData && (
+        {!isProcessing && !manualMode && detectionResult && (
           <div className="space-y-4">
             <div className="flex items-center gap-2 text-green-600">
               <Check className="h-5 w-5" />
@@ -250,39 +330,112 @@ export function CalibrationViewer({
             <div className="space-y-2">
               <Label>Circle Radius Adjustment</Label>
               <Slider
-                value={[circleData.radius]}
-                onValueChange={handleAdjustRadius}
-                min={circleData.radius * 0.5}
-                max={circleData.radius * 1.5}
+                value={[detectionResult.radius]}
+                onValueChange={handleRadiusChange}
+                min={detectionResult.radius * 0.5}
+                max={detectionResult.radius * 1.5}
                 step={1}
               />
               <div className="flex justify-between text-sm text-muted-foreground">
                 <span>Smaller</span>
-                <span>Current: {Math.round(circleData.radius)}px</span>
+                <span>Current: {Math.round(detectionResult.radius)}px</span>
                 <span>Larger</span>
               </div>
             </div>
 
             <div className="bg-muted p-3 rounded-lg text-sm">
               <p>
-                <strong>Calibration:</strong> {scaleFactor.toFixed(2)} pixels
-                per meter
+                <strong>Calibration:</strong> {getScaleFactor().toFixed(2)}{' '}
+                pixels per meter
               </p>
               <p className="text-muted-foreground">
                 Based on standard 2.135m diameter throwing circle
               </p>
             </div>
+
+            <Button
+              variant="outline"
+              onClick={() => setManualMode(true)}
+              className="w-full"
+            >
+              <Move className="h-4 w-4 mr-2" />
+              Switch to Manual Mode
+            </Button>
           </div>
         )}
 
-        {!isProcessing && !circleData && !openCVError && (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription>
-              Could not detect throwing circle automatically. Please ensure the
-              circle is clearly visible in the video.
-            </AlertDescription>
-          </Alert>
+        {!isProcessing && manualMode && (
+          <div className="space-y-4">
+            <Alert>
+              <Move className="h-4 w-4" />
+              <AlertDescription>
+                <strong>Manual Mode:</strong> Click on the video to set the
+                circle center, then adjust the radius.
+              </AlertDescription>
+            </Alert>
+
+            {manualCenter && (
+              <div className="space-y-2">
+                <Label>Circle Radius</Label>
+                <Slider
+                  value={[manualRadius]}
+                  onValueChange={handleRadiusChange}
+                  min={20}
+                  max={Math.min(canvasWidth, canvasHeight) / 2}
+                  step={1}
+                />
+                <div className="flex justify-between text-sm text-muted-foreground">
+                  <span>Smaller</span>
+                  <span>Current: {Math.round(manualRadius)}px</span>
+                  <span>Larger</span>
+                </div>
+              </div>
+            )}
+
+            {!manualCenter && (
+              <p className="text-muted-foreground text-sm">
+                Click on the video to place the circle center.
+              </p>
+            )}
+
+            <div className="bg-muted p-3 rounded-lg text-sm">
+              <p>
+                <strong>Calibration:</strong>{' '}
+                {manualCenter
+                  ? `${getScaleFactor().toFixed(2)} pixels per meter`
+                  : 'Position the circle first'}
+              </p>
+              <p className="text-muted-foreground">
+                Based on standard 2.135m diameter throwing circle
+              </p>
+            </div>
+
+            {detectionResult && (
+              <Button
+                variant="outline"
+                onClick={() => setManualMode(false)}
+                className="w-full"
+              >
+                Return to Auto Detection
+              </Button>
+            )}
+          </div>
+        )}
+
+        {!isProcessing && !detectionResult && !manualMode && !openCVError && (
+          <div className="space-y-4">
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription>
+                Could not detect throwing circle automatically. The circle may
+                not be clearly visible, or the video angle may not be suitable.
+              </AlertDescription>
+            </Alert>
+            <Button onClick={() => setManualMode(true)} className="w-full">
+              <Move className="h-4 w-4 mr-2" />
+              Use Manual Calibration
+            </Button>
+          </div>
         )}
 
         {openCVError && (
@@ -313,7 +466,11 @@ export function CalibrationViewer({
         <Button
           onClick={handleComplete}
           disabled={
-            !circleData || isProcessing || isOpenCVLoading || !!openCVError
+            isProcessing ||
+            isOpenCVLoading ||
+            !!openCVError ||
+            (manualMode && !manualCenter) ||
+            (!manualMode && !detectionResult)
           }
         >
           {isOpenCVLoading ? 'Loading...' : 'Start Analysis'}

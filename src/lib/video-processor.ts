@@ -1,8 +1,19 @@
-import { trackHammerTrajectory } from './hammer-tracker'
+import {
+  trackHammerTrajectory,
+  trackHammerTrajectoryWithWorker,
+} from './hammer-tracker'
 import { calculatePhysics } from './physics-engine'
+import type {
+  PhysicsCalculationPayload,
+  PhysicsResultPayload,
+  PhysicsWorkerInput,
+  PhysicsWorkerOutput,
+} from './worker-utils'
 
 export interface HammerThrowResult {
-  distance: number
+  trackedDistance: number
+  predictedDistance: number
+  distanceConfidence: number
   releaseAngle: number
   releaseVelocity: number
   flightTime: number
@@ -10,7 +21,7 @@ export interface HammerThrowResult {
   totalFrames: number
   fps: number
   scaleFactor: number
-  trajectory: { x: number; y: number }[]
+  trajectory: Array<{ x: number; y: number }>
   releasePoint: { x: number; y: number } | null
   landingPoint: { x: number; y: number } | null
 }
@@ -23,41 +34,113 @@ interface ProcessVideoOptions {
     scaleFactor: number
   }
   hammerWeight: 'men' | 'women'
+  useWorkers?: boolean
   onProgress: (_progress: number) => void
+}
+
+async function calculatePhysicsWithWorker(
+  payload: PhysicsCalculationPayload,
+): Promise<PhysicsResultPayload> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./physics.worker.ts', import.meta.url), {
+      type: 'module',
+    })
+
+    worker.onmessage = (e: MessageEvent<PhysicsWorkerOutput>) => {
+      worker.terminate()
+      if (e.data.type === 'result') {
+        resolve(e.data.payload as PhysicsResultPayload)
+      } else {
+        reject(new Error(e.data.payload as string))
+      }
+    }
+
+    worker.onerror = (e) => {
+      worker.terminate()
+      reject(new Error(`Physics worker error: ${e.message}`))
+    }
+
+    const input: PhysicsWorkerInput = {
+      type: 'calculate',
+      payload,
+    }
+    worker.postMessage(input)
+  })
 }
 
 export async function processVideo(
   options: ProcessVideoOptions,
 ): Promise<HammerThrowResult> {
-  const { videoUrl, calibrationData, onProgress } = options
+  const { videoUrl, calibrationData, onProgress, useWorkers = true } = options
+  console.log('[VideoProcessor] Starting video processing...')
+  console.log(`[VideoProcessor] Workers enabled: ${useWorkers}`)
 
   return new Promise((resolve, reject) => {
     const video = document.createElement('video')
     video.src = videoUrl
     video.crossOrigin = 'anonymous'
 
-    // Set a timeout for video loading
     const timeoutId = setTimeout(() => {
+      video.src = ''
+      video.remove()
       reject(new Error('Video load timeout - took longer than 30 seconds'))
     }, 30000)
 
+    const cleanupVideo = () => {
+      video.src = ''
+      video.remove()
+    }
+
     video.onloadedmetadata = async () => {
+      console.log(
+        '[VideoProcessor] Video metadata loaded, duration:',
+        video.duration,
+      )
       clearTimeout(timeoutId)
       try {
-        const fps = 30 // Estimated
+        const fps = 30
         const totalFrames = Math.round(video.duration * fps)
+        console.log(
+          `[VideoProcessor] Video info: ${totalFrames} frames, ${fps}fps`,
+        )
+
+        if (video.duration > 120) {
+          throw new Error('Video too long. Please use a video under 2 minutes.')
+        }
 
         onProgress(10)
 
-        // Track hammer trajectory
-        const trackingResult = await trackHammerTrajectory(
-          video,
-          fps,
-          (progress: number) => {
-            // Map tracking progress (0-100) to overall progress (10-70)
-            onProgress(10 + progress * 0.6)
+        const trackFn = useWorkers
+          ? trackHammerTrajectoryWithWorker
+          : trackHammerTrajectory
+        console.log(
+          `[VideoProcessor] Using ${useWorkers ? 'worker' : 'legacy'} tracking`,
+        )
+
+        const trackingPromise = trackFn(video, fps, (progress: number) => {
+          onProgress(10 + progress * 0.6)
+        })
+
+        const trackingTimeoutPromise = new Promise<never>(
+          (_, timeoutReject) => {
+            setTimeout(
+              () =>
+                timeoutReject(
+                  new Error(
+                    'Video processing timeout - took longer than 5 minutes',
+                  ),
+                ),
+              300000,
+            )
           },
         )
+
+        console.log('[VideoProcessor] Starting tracking...')
+        const trackingResult = await Promise.race([
+          trackingPromise,
+          trackingTimeoutPromise,
+        ])
+        console.log('[VideoProcessor] Tracking complete')
 
         onProgress(70)
 
@@ -67,24 +150,50 @@ export async function processVideo(
 
         onProgress(80)
 
-        // Calculate physics metrics
-        const physics = calculatePhysics({
-          trajectory: trackingResult.trajectory,
-          releasePoint: trackingResult.releasePoint,
-          landingPoint: trackingResult.landingPoint,
-          releaseFrame: trackingResult.releaseFrame,
-          fps,
-          scaleFactor: calibrationData.scaleFactor,
-          circleCenter: calibrationData.circleCenter,
-        })
+        let physicsResult: {
+          trackedDistance: number
+          predictedDistance: number
+          distanceConfidence: number
+          releaseAngle: number
+          releaseVelocity: number
+          flightTime: number
+        }
+
+        if (useWorkers) {
+          console.log('[VideoProcessor] Calculating physics in worker...')
+          const physicsPayload: PhysicsCalculationPayload = {
+            trajectory: trackingResult.trajectory,
+            releasePoint: trackingResult.releasePoint,
+            landingPoint: trackingResult.landingPoint,
+            releaseFrame: trackingResult.releaseFrame,
+            fps,
+            scaleFactor: calibrationData.scaleFactor,
+            circleCenter: calibrationData.circleCenter,
+          }
+          physicsResult = await calculatePhysicsWithWorker(physicsPayload)
+          console.log('[VideoProcessor] Physics calculation complete')
+        } else {
+          console.log('[VideoProcessor] Calculating physics on main thread...')
+          physicsResult = calculatePhysics({
+            trajectory: trackingResult.trajectory,
+            releasePoint: trackingResult.releasePoint,
+            landingPoint: trackingResult.landingPoint,
+            releaseFrame: trackingResult.releaseFrame,
+            fps,
+            scaleFactor: calibrationData.scaleFactor,
+            circleCenter: calibrationData.circleCenter,
+          })
+        }
 
         onProgress(90)
 
         const result: HammerThrowResult = {
-          distance: physics.distance,
-          releaseAngle: physics.releaseAngle,
-          releaseVelocity: physics.releaseVelocity,
-          flightTime: physics.flightTime,
+          trackedDistance: physicsResult.trackedDistance,
+          predictedDistance: physicsResult.predictedDistance,
+          distanceConfidence: physicsResult.distanceConfidence,
+          releaseAngle: physicsResult.releaseAngle,
+          releaseVelocity: physicsResult.releaseVelocity,
+          flightTime: physicsResult.flightTime,
           releaseFrame: trackingResult.releaseFrame,
           totalFrames,
           fps,
@@ -95,14 +204,19 @@ export async function processVideo(
         }
 
         onProgress(100)
+        cleanupVideo()
+        console.log('[VideoProcessor] Processing complete')
         resolve(result)
       } catch (error) {
+        console.error('[VideoProcessor] Error during processing:', error)
+        cleanupVideo()
         reject(error)
       }
     }
 
     video.onerror = () => {
       clearTimeout(timeoutId)
+      cleanupVideo()
       reject(new Error('Failed to load video for processing'))
     }
   })

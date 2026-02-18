@@ -1,24 +1,26 @@
-import { useRef, useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import {
+  Clock,
+  Download,
+  Gauge,
+  RotateCcw,
+  Ruler,
+  Target,
+  TrendingUp,
+  Zap,
+} from 'lucide-react'
+import type { HammerThrowResult } from '@/lib/video-processor'
 import {
   Card,
   CardContent,
-  CardHeader,
-  CardTitle,
   CardDescription,
   CardFooter,
+  CardHeader,
+  CardTitle,
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
-import { HammerThrowResult } from '@/lib/video-processor'
-import {
-  RotateCcw,
-  Download,
-  Ruler,
-  Gauge,
-  Clock,
-  TrendingUp,
-} from 'lucide-react'
 
 interface ResultsDisplayProps {
   results: HammerThrowResult
@@ -34,7 +36,6 @@ export function ResultsDisplay({
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [trajectoryImage, setTrajectoryImage] = useState<string | null>(null)
 
-  // Generate trajectory visualization
   useEffect(() => {
     if (!canvasRef.current || results.trajectory.length === 0) return
 
@@ -42,10 +43,8 @@ export function ResultsDisplay({
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-    // Draw trajectory path
     if (results.trajectory.length > 1) {
       ctx.strokeStyle = '#3b82f6'
       ctx.lineWidth = 3
@@ -64,7 +63,6 @@ export function ResultsDisplay({
       ctx.stroke()
     }
 
-    // Draw release point
     if (results.releasePoint) {
       ctx.fillStyle = '#22c55e'
       ctx.beginPath()
@@ -72,7 +70,6 @@ export function ResultsDisplay({
       ctx.fill()
     }
 
-    // Draw landing point
     if (results.landingPoint) {
       ctx.fillStyle = '#ef4444'
       ctx.beginPath()
@@ -80,12 +77,17 @@ export function ResultsDisplay({
       ctx.fill()
     }
 
-    // Export as image
     setTrajectoryImage(canvas.toDataURL('image/png'))
   }, [results])
 
   const weightText =
     hammerWeight === 'men' ? "Men's (7.26 kg)" : "Women's (4 kg)"
+
+  const primaryDistance =
+    results.distanceConfidence > 0.7
+      ? results.trackedDistance
+      : results.predictedDistance
+  const confidencePercent = Math.round(results.distanceConfidence * 100)
 
   return (
     <div className="space-y-6">
@@ -99,7 +101,7 @@ export function ResultsDisplay({
               </CardDescription>
             </div>
             <Badge variant="secondary" className="text-lg px-4 py-2">
-              {results.distance.toFixed(2)} m
+              {primaryDistance.toFixed(2)} m
             </Badge>
           </div>
         </CardHeader>
@@ -118,14 +120,50 @@ export function ResultsDisplay({
                   <CardContent className="pt-6">
                     <div className="flex items-center gap-3">
                       <div className="p-2 bg-primary/10 rounded-lg">
+                        <Target className="h-5 w-5 text-primary" />
+                      </div>
+                      <div>
+                        <p className="text-sm text-muted-foreground">
+                          Measured Distance
+                        </p>
+                        <p className="text-2xl font-bold">
+                          {results.trackedDistance.toFixed(2)} m
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardContent className="pt-6">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 bg-primary/10 rounded-lg">
+                        <Zap className="h-5 w-5 text-primary" />
+                      </div>
+                      <div>
+                        <p className="text-sm text-muted-foreground">
+                          Predicted Distance
+                        </p>
+                        <p className="text-2xl font-bold">
+                          {results.predictedDistance.toFixed(2)} m
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardContent className="pt-6">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 bg-primary/10 rounded-lg">
                         <Ruler className="h-5 w-5 text-primary" />
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">
-                          Distance
+                          Confidence
                         </p>
                         <p className="text-2xl font-bold">
-                          {results.distance.toFixed(2)} m
+                          {confidencePercent}%
                         </p>
                       </div>
                     </div>
@@ -193,15 +231,20 @@ export function ResultsDisplay({
                 </p>
                 <ul className="space-y-1">
                   <li>
+                    • Measured distance: tracked from circle center to landing
+                    point
+                  </li>
+                  <li>
+                    • Predicted distance: calculated from release velocity and
+                    angle (v² sin 2θ / g)
+                  </li>
+                  <li>
+                    • Confidence: agreement between measured and predicted
+                    values ({confidencePercent}%)
+                  </li>
+                  <li>
                     • Release frame detected at {results.releaseFrame} of{' '}
                     {results.totalFrames} frames
-                  </li>
-                  <li>• Landing point calculated from trajectory analysis</li>
-                  <li>
-                    • Velocity calculated using frame-by-frame motion tracking
-                  </li>
-                  <li>
-                    • Distance measured from circle center to landing point
                   </li>
                 </ul>
               </div>
@@ -209,6 +252,43 @@ export function ResultsDisplay({
 
             <TabsContent value="physics" className="space-y-4 mt-4">
               <div className="space-y-4">
+                <div className="bg-muted p-4 rounded-lg">
+                  <p className="font-medium mb-2">Distance Comparison</p>
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <span className="text-muted-foreground">
+                        Measured (tracked):
+                      </span>
+                      <span className="ml-2 font-medium">
+                        {results.trackedDistance.toFixed(2)} m
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">
+                        Predicted (physics):
+                      </span>
+                      <span className="ml-2 font-medium">
+                        {results.predictedDistance.toFixed(2)} m
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Difference:</span>
+                      <span className="ml-2 font-medium">
+                        {Math.abs(
+                          results.trackedDistance - results.predictedDistance,
+                        ).toFixed(2)}{' '}
+                        m
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Confidence:</span>
+                      <span className="ml-2 font-medium">
+                        {confidencePercent}%
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-2 gap-4">
                   <div className="bg-muted p-4 rounded-lg">
                     <p className="text-sm text-muted-foreground mb-1">

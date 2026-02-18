@@ -1,11 +1,13 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { AlertCircle } from 'lucide-react'
+import type {HammerThrowResult} from '@/lib/video-processor';
 import {
   Card,
   CardContent,
+  CardDescription,
   CardHeader,
   CardTitle,
-  CardDescription,
 } from '@/components/ui/card'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
@@ -15,9 +17,8 @@ import { CalibrationViewer } from '@/components/hammer-analyzer/calibration-view
 import { ProcessingStatus } from '@/components/hammer-analyzer/processing-status'
 import { ResultsDisplay } from '@/components/hammer-analyzer/results-display'
 import { useVideoMetadata } from '@/hooks/use-video-metadata'
-import { loadOpenCV, isOpenCVLoaded } from '@/hooks/use-opencv'
-import { processVideo, type HammerThrowResult } from '@/lib/video-processor'
-import { AlertCircle } from 'lucide-react'
+import { isOpenCVLoaded, loadOpenCV } from '@/hooks/use-opencv'
+import {  processVideo } from '@/lib/video-processor'
 
 export const Route = createFileRoute('/analyze')({
   component: AnalyzePage,
@@ -36,8 +37,22 @@ function AnalyzePage() {
   const [isLoadingOpenCV, setIsLoadingOpenCV] = useState(false)
   const [openCVLoadError, setOpenCVLoadError] = useState<string | null>(null)
 
-  const videoRef = useRef<HTMLVideoElement>(null)
+  const videoUrlRef = useRef<string | null>(null)
   const { metadata, warnings } = useVideoMetadata(videoFile)
+
+  // Keep ref in sync with videoUrl state
+  useEffect(() => {
+    videoUrlRef.current = videoUrl
+  }, [videoUrl])
+
+  // Cleanup blob URL ONLY on component unmount
+  useEffect(() => {
+    return () => {
+      if (videoUrlRef.current) {
+        URL.revokeObjectURL(videoUrlRef.current)
+      }
+    }
+  }, [])
 
   // Load OpenCV on demand when video is uploaded
   useEffect(() => {
@@ -62,8 +77,13 @@ function AnalyzePage() {
   }, [videoFile, isLoadingOpenCV, openCVLoadError])
 
   const handleVideoUpload = useCallback((file: File) => {
+    if (videoUrlRef.current) {
+      URL.revokeObjectURL(videoUrlRef.current)
+    }
+    const newUrl = URL.createObjectURL(file)
+    videoUrlRef.current = newUrl
     setVideoFile(file)
-    setVideoUrl(URL.createObjectURL(file))
+    setVideoUrl(newUrl)
     setStep('calibration')
     setError(null)
   }, [])
@@ -98,6 +118,10 @@ function AnalyzePage() {
   )
 
   const handleReset = useCallback(() => {
+    if (videoUrlRef.current) {
+      URL.revokeObjectURL(videoUrlRef.current)
+      videoUrlRef.current = null
+    }
     setVideoFile(null)
     setVideoUrl(null)
     setStep('upload')
@@ -193,15 +217,6 @@ function AnalyzePage() {
           results={results}
           hammerWeight={hammerWeight}
           onReset={handleReset}
-        />
-      )}
-
-      {videoUrl && (
-        <video
-          ref={videoRef}
-          src={videoUrl}
-          className="hidden"
-          crossOrigin="anonymous"
         />
       )}
     </div>

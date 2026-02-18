@@ -39,17 +39,31 @@ export function useOpenCV() {
 }
 
 async function loadOpenCVInternal(): Promise<void> {
+  console.log('[OpenCV] Starting OpenCV load...')
+
   // Add timeout for OpenCV loading - it can take a while and freeze on weak hardware
   const loadPromise = import('@techstark/opencv-js')
+    .then((cv) => {
+      console.log('[OpenCV] Import resolved successfully')
+      return cv
+    })
+    .catch((err) => {
+      console.error('[OpenCV] Import failed:', err)
+      throw err
+    })
+
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(() => {
+      console.error('[OpenCV] Load timeout after 30 seconds')
       reject(
         new Error('OpenCV load timeout - library is too large for this device'),
       )
     }, 30000) // 30 second timeout
   })
 
+  console.log('[OpenCV] Waiting for import or timeout...')
   const cv = await Promise.race([loadPromise, timeoutPromise])
+  console.log('[OpenCV] Loaded successfully')
   cvInstance = cv
 }
 
