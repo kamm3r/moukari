@@ -7,6 +7,8 @@ export interface InitPayload {
   videoWidth: number
   videoHeight: number
   fps: number
+  frameStep: number
+  circleCenter: { x: number; y: number }
 }
 
 export interface FramePayload {
@@ -28,7 +30,7 @@ export interface TrackingResultPayload {
   trajectory: Array<{ x: number; y: number }>
   releasePoint: { x: number; y: number } | null
   landingPoint: { x: number; y: number } | null
-  releaseFrame: number
+  releaseFrame: number // index in trajectory array (not raw video frame)
 }
 
 export interface PhysicsWorkerInput {
@@ -40,8 +42,9 @@ export interface PhysicsCalculationPayload {
   trajectory: Array<{ x: number; y: number }>
   releasePoint: { x: number; y: number }
   landingPoint: { x: number; y: number }
-  releaseFrame: number
+  releaseFrame: number // index in trajectory array
   fps: number
+  frameStep: number
   scaleFactor: number
   circleCenter: { x: number; y: number }
 }
@@ -60,52 +63,9 @@ export interface PhysicsResultPayload {
   flightTime: number
 }
 
-export function createWorker<TInput, TOutput>(
-  workerUrl: string,
-): Promise<{
-  send: (data: TInput) => void
-  receive: () => Promise<TOutput>
-  terminate: () => void
-}> {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL(workerUrl, import.meta.url), {
-      type: 'module',
-    })
-
-    let pendingResolve: ((value: TOutput) => void) | null = null
-
-    worker.onmessage = (e: MessageEvent<TOutput>) => {
-      if (pendingResolve) {
-        pendingResolve(e.data)
-        pendingResolve = null
-      }
-    }
-
-    worker.onerror = (e) => {
-      reject(new Error(`Worker error: ${e.message}`))
-    }
-
-    resolve({
-      send: (data: TInput) => worker.postMessage(data),
-      receive: () =>
-        new Promise((resolveReceive) => {
-          pendingResolve = resolveReceive
-        }),
-      terminate: () => worker.terminate(),
-    })
-  })
-}
-
 export async function createImageBitmapFromCanvas(
   canvas: HTMLCanvasElement,
 ): Promise<ImageBitmap> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) {
-        createImageBitmap(blob).then(resolve).catch(reject)
-      } else {
-        reject(new Error('Failed to create blob from canvas'))
-      }
-    })
-  })
+  // Faster than toBlob in modern browsers
+  return createImageBitmap(canvas)
 }

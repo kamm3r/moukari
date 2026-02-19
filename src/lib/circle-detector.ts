@@ -1,7 +1,6 @@
-import * as cvImport from '@techstark/opencv-js'
+import { getOpenCV, loadOpenCV } from '@/hooks/use-opencv'
 
-let cvModule: typeof cvImport | null = null
-let cvReady = false
+let cvModule: any | null = null
 
 export interface CircleDetectionResult {
   center: { x: number; y: number }
@@ -11,42 +10,9 @@ export interface CircleDetectionResult {
 }
 
 export async function preloadOpenCV(): Promise<void> {
-  if (cvReady && cvModule) return
-  console.log('[CircleDetector] Preloading OpenCV...')
-  await new Promise((resolve) => setTimeout(resolve, 100))
-
-  const cvAny = cvImport as unknown as {
-    Mat?: unknown
-    then?: (fn: (m: typeof cvImport) => void) => void
-  }
-
-  const waitForInit = (): Promise<void> => {
-    return new Promise<void>((resolve) => {
-      const checkReady = () => {
-        if (cvAny.Mat && typeof cvAny.Mat === 'function') {
-          console.log('[CircleDetector] OpenCV ready (Mat available)')
-          resolve()
-        } else {
-          console.log('[CircleDetector] Waiting for OpenCV Mat...')
-          setTimeout(checkReady, 50)
-        }
-      }
-      checkReady()
-    })
-  }
-
-  if (cvAny.then && typeof cvAny.then === 'function') {
-    console.log('[CircleDetector] OpenCV is a Promise, awaiting...')
-    cvModule = await new Promise((resolve) => {
-      cvAny.then!((m: typeof cvImport) => resolve(m))
-    })
-    cvReady = true
-  } else {
-    await waitForInit()
-    cvModule = cvImport
-    cvReady = true
-  }
-  console.log('[CircleDetector] OpenCV preloaded')
+  await loadOpenCV()
+  cvModule = getOpenCV()
+  if (!cvModule) throw new Error('OpenCV not loaded')
 }
 
 interface CircleCandidate {
@@ -73,10 +39,7 @@ function scoreCircleCandidate(
 
   const minExpectedRadius = Math.min(imageWidth, imageHeight) * 0.08
   const maxExpectedRadius = Math.min(imageWidth, imageHeight) * 0.28
-  if (
-    circle.radius >= minExpectedRadius &&
-    circle.radius <= maxExpectedRadius
-  ) {
+  if (circle.radius >= minExpectedRadius && circle.radius <= maxExpectedRadius) {
     const optimalRadius = Math.min(imageWidth, imageHeight) * 0.18
     const radiusRatio = Math.min(
       circle.radius / optimalRadius,
@@ -96,119 +59,113 @@ function getConfidenceLevel(score: number): 'low' | 'medium' | 'high' {
   return 'low'
 }
 
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()))
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw new Error('Circle detection aborted')
+}
+
 export async function detectThrowingCircle(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
+  signal?: AbortSignal,
 ): Promise<CircleDetectionResult | null> {
-  console.log('[CircleDetector] Starting circle detection...')
+  if (!cvModule) await preloadOpenCV()
+  const cv = cvModule as any
 
-  if (!cvModule) {
-    console.error(
-      '[CircleDetector] OpenCV not preloaded! Call preloadOpenCV() first.',
-    )
-    throw new Error('OpenCV not loaded')
-  }
-  const cv = cvModule
-  console.log('[CircleDetector] Using preloaded OpenCV')
+  throwIfAborted(signal)
 
   const ctx = canvas.getContext('2d')
-  if (!ctx) {
-    console.error('[CircleDetector] Failed to get canvas context')
-    return null
-  }
+  if (!ctx) return null
 
-  const maxDimension = 640
+  // Aggressive downscale = huge speed win
+  const maxDimension = 320
   const scale = Math.min(
     1,
     maxDimension / Math.max(canvas.width, canvas.height),
   )
-  const processWidth = Math.round(canvas.width * scale)
-  const processHeight = Math.round(canvas.height * scale)
-  console.log(
-    `[CircleDetector] Processing at ${processWidth}x${processHeight} (scale: ${scale})`,
-  )
+  const processWidth = Math.max(2, Math.round(canvas.width * scale))
+  const processHeight = Math.max(2, Math.round(canvas.height * scale))
 
   const tempCanvas = document.createElement('canvas')
   tempCanvas.width = processWidth
   tempCanvas.height = processHeight
   const tempCtx = tempCanvas.getContext('2d')
-  if (!tempCtx) {
-    console.error('[CircleDetector] Failed to get temp canvas context')
-    return null
-  }
+  if (!tempCtx) return null
 
-  console.log('[CircleDetector] Drawing video frame...')
+  // Draw a single frame
   tempCtx.drawImage(video, 0, 0, processWidth, processHeight)
 
+  // Yield so UI can render “Detecting…”
+  await nextFrame()
+  throwIfAborted(signal)
+
   const imageData = tempCtx.getImageData(0, 0, processWidth, processHeight)
+
   const src = cv.matFromImageData(imageData)
   const gray = new cv.Mat()
   const blurred = new cv.Mat()
 
   try {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY)
-    cv.GaussianBlur(gray, blurred, new cv.Size(9, 9), 2)
 
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    // Median blur is often cheaper than large Gaussian kernels in JS/WASM
+    cv.medianBlur(gray, blurred, 5)
+
+    await nextFrame()
+    throwIfAborted(signal)
 
     const circles = new cv.Mat()
+
+    // Tighter params: fewer candidates, faster
+    const minR = Math.round(Math.min(processWidth, processHeight) * 0.09)
+    const maxR = Math.round(Math.min(processWidth, processHeight) * 0.30)
+
     cv.HoughCircles(
       blurred,
       circles,
       cv.HOUGH_GRADIENT,
-      1,
-      gray.rows / 8,
-      100,
-      30,
-      Math.min(gray.rows, gray.cols) / 12,
-      Math.min(gray.rows, gray.cols) / 3,
+      1.2, // dp
+      gray.rows / 6, // minDist
+      120, // param1 (Canny high)
+      35, // param2 (accumulator threshold) ↑ => fewer circles
+      minR,
+      maxR,
     )
-    console.log(`[CircleDetector] HoughCircles found ${circles.cols} circles`)
 
-    if (circles.cols === 0) {
-      console.log('[CircleDetector] No circles found')
+    const count = circles.cols ?? 0
+    if (count === 0) {
       circles.delete()
       return null
     }
 
     const candidates: Array<CircleCandidate> = []
-    for (let i = 0; i < circles.cols; i++) {
+    for (let i = 0; i < count; i++) {
       const x = circles.data32F[i * 3]
       const y = circles.data32F[i * 3 + 1]
       const radius = circles.data32F[i * 3 + 2]
-
       const score = scoreCircleCandidate(
         { x, y, radius },
         processWidth,
         processHeight,
       )
-      console.log(
-        `[CircleDetector] Circle ${i}: x=${x.toFixed(0)}, y=${y.toFixed(0)}, r=${radius.toFixed(0)}, score=${score.toFixed(1)}`,
-      )
-
       candidates.push({ x, y, radius, score })
     }
 
     candidates.sort((a, b) => b.score - a.score)
     const best = candidates[0]
 
-    const scaleBack = 1 / scale
     circles.delete()
 
-    const result: CircleDetectionResult = {
+    const scaleBack = 1 / scale
+    return {
       center: { x: best.x * scaleBack, y: best.y * scaleBack },
       radius: best.radius * scaleBack,
       confidence: getConfidenceLevel(best.score),
       score: best.score,
     }
-
-    console.log(
-      `[CircleDetector] Best circle: score=${best.score.toFixed(1)}, confidence=${result.confidence}`,
-    )
-    return result
-  } catch (error) {
-    console.error('[CircleDetector] Error during detection:', error)
-    throw error
   } finally {
     src.delete()
     gray.delete()

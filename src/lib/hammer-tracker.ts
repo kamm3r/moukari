@@ -1,4 +1,3 @@
-import { preloadOpenCV } from './circle-detector'
 import type {
   FramePayload,
   InitPayload,
@@ -6,24 +5,172 @@ import type {
   TrackingWorkerInput,
   TrackingWorkerOutput,
 } from './worker-utils'
+import { createImageBitmapFromCanvas } from './worker-utils'
+
+export interface TurnMetrics {
+  turnNumber: number
+  startIndex: number
+  endIndex: number
+  durationSec: number
+  avgTangentialVelocity: number
+  peakTangentialVelocity: number
+  avgTangentialAcceleration: number
+  peakTangentialAcceleration: number
+  avgCentripetalAcceleration: number
+  peakCentripetalAcceleration: number
+}
 
 export interface TrackingResult {
   trajectory: Array<{ x: number; y: number }>
   releasePoint: { x: number; y: number } | null
   landingPoint: { x: number; y: number } | null
-  releaseFrame: number
+  releaseFrame: number // index in trajectory array
+  turns: TurnMetrics[]
+}
+
+function unwrapAngles(angles: number[]): number[] {
+  if (angles.length === 0) return []
+  const out = [angles[0]]
+  for (let i = 1; i < angles.length; i++) {
+    let d = angles[i] - angles[i - 1]
+    while (d > Math.PI) d -= 2 * Math.PI
+    while (d < -Math.PI) d += 2 * Math.PI
+    out.push(out[i - 1] + d)
+  }
+  return out
+}
+
+function analyzeTurns(options: {
+  trajectory: Array<{ x: number; y: number }>
+  releaseIndex: number
+  circleCenter: { x: number; y: number }
+  scaleFactor: number // px/m
+  fps: number
+  frameStep: number
+}): TurnMetrics[] {
+  const { trajectory, releaseIndex, circleCenter, scaleFactor, fps, frameStep } =
+    options
+
+  if (trajectory.length < 12 || releaseIndex < 8) return []
+
+  const dt = frameStep / fps
+  const pre = trajectory.slice(0, Math.min(releaseIndex + 1, trajectory.length))
+
+  const rawAngles = pre.map((p) =>
+    Math.atan2(p.y - circleCenter.y, p.x - circleCenter.x),
+  )
+  const angles = unwrapAngles(rawAngles)
+
+  // Convert to cumulative rotation magnitude (handle direction)
+  const totalRot = angles[angles.length - 1] - angles[0]
+  const dir = totalRot >= 0 ? 1 : -1
+
+  const rMeters = pre.map((p) => {
+    const dx = p.x - circleCenter.x
+    const dy = p.y - circleCenter.y
+    return Math.sqrt(dx * dx + dy * dy) / scaleFactor
+  })
+
+  const omega: number[] = [0]
+  for (let i = 1; i < angles.length; i++) {
+    omega.push(((angles[i] - angles[i - 1]) * dir) / dt)
+  }
+
+  const vTan: number[] = omega.map((w, i) => Math.abs(w) * rMeters[i])
+
+  const aTan: number[] = [0]
+  for (let i = 1; i < vTan.length; i++) {
+    aTan.push((vTan[i] - vTan[i - 1]) / dt)
+  }
+
+  const aCent: number[] = vTan.map((v, i) => {
+    const r = Math.max(rMeters[i], 1e-6)
+    return (v * v) / r
+  })
+
+  const turns: TurnMetrics[] = []
+  let start = 0
+
+  for (let i = 1; i < angles.length; i++) {
+    const rotFromStart = (angles[i] - angles[start]) * dir
+    if (rotFromStart >= 2 * Math.PI) {
+      turns.push(
+        summarizeTurn({
+          turnNumber: turns.length + 1,
+          startIndex: start,
+          endIndex: i,
+          dt,
+          vTan,
+          aTan,
+          aCent,
+        }),
+      )
+      start = i
+    }
+  }
+
+  // Partial last turn if significant (>= 90 degrees)
+  if (start < angles.length - 4) {
+    const rem = Math.abs((angles[angles.length - 1] - angles[start]) * dir)
+    if (rem >= Math.PI / 2) {
+      turns.push(
+        summarizeTurn({
+          turnNumber: turns.length + 1,
+          startIndex: start,
+          endIndex: angles.length - 1,
+          dt,
+          vTan,
+          aTan,
+          aCent,
+        }),
+      )
+    }
+  }
+
+  return turns
+}
+
+function summarizeTurn(args: {
+  turnNumber: number
+  startIndex: number
+  endIndex: number
+  dt: number
+  vTan: number[]
+  aTan: number[]
+  aCent: number[]
+}): TurnMetrics {
+  const { turnNumber, startIndex, endIndex, dt, vTan, aTan, aCent } = args
+  const slice = (arr: number[]) => arr.slice(startIndex, endIndex + 1)
+  const avg = (arr: number[]) =>
+    arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : 0
+  const peak = (arr: number[]) => (arr.length ? Math.max(...arr) : 0)
+
+  const v = slice(vTan)
+  const at = slice(aTan)
+  const ac = slice(aCent)
+
+  return {
+    turnNumber,
+    startIndex,
+    endIndex,
+    durationSec: (endIndex - startIndex) * dt,
+    avgTangentialVelocity: avg(v),
+    peakTangentialVelocity: peak(v),
+    avgTangentialAcceleration: avg(at),
+    peakTangentialAcceleration: peak(at),
+    avgCentripetalAcceleration: avg(ac),
+    peakCentripetalAcceleration: peak(ac),
+  }
 }
 
 export async function trackHammerTrajectoryWithWorker(
   video: HTMLVideoElement,
   fps: number,
+  frameStep: number,
+  circleCenter: { x: number; y: number },
+  scaleFactor: number,
   onProgress: (progress: number) => void,
 ): Promise<TrackingResult> {
-  console.log('[HammerTracker] Starting worker-based trajectory tracking...')
-  console.log(
-    `[HammerTracker] Video: ${video.videoWidth}x${video.videoHeight}, duration: ${video.duration}s`,
-  )
-
   const worker = new Worker(new URL('./tracking.worker.ts', import.meta.url), {
     type: 'module',
   })
@@ -40,7 +187,6 @@ export async function trackHammerTrajectoryWithWorker(
   const ctx = canvas.getContext('2d')
   if (!ctx) throw new Error('Failed to create canvas context')
 
-  const frameStep = 6
   const totalFrames = Math.round(video.duration * fps)
 
   let pendingResolve: ((value: TrackingWorkerOutput) => void) | null = null
@@ -72,14 +218,31 @@ export async function trackHammerTrajectoryWithWorker(
     })
   }
 
+  const seekTo = async (time: number) => {
+    video.currentTime = time
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Video seek timeout at t=${time.toFixed(3)}`))
+      }, 5000)
+
+      const handleSeek = () => {
+        clearTimeout(timeout)
+        resolve()
+      }
+
+      video.addEventListener('seeked', handleSeek, { once: true })
+    })
+  }
+
   try {
     const initPayload: InitPayload = {
       videoWidth: video.videoWidth,
       videoHeight: video.videoHeight,
       fps,
+      frameStep,
+      circleCenter,
     }
     await sendAndWait({ type: 'init', payload: initPayload })
-    console.log('[HammerTracker] Worker initialized')
 
     const startTime = Date.now()
     const maxProcessingTime = 300000
@@ -92,35 +255,14 @@ export async function trackHammerTrajectoryWithWorker(
       }
 
       if (framesProcessed % 3 === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 10))
+        await new Promise((resolve) => setTimeout(resolve, 0))
       }
 
-      const time = frameNum / fps
-      video.currentTime = time
-
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          reject(new Error(`Video seek timeout at frame ${frameNum}`))
-        }, 5000)
-
-        const handleSeek = () => {
-          clearTimeout(timeout)
-          resolve()
-        }
-        video.addEventListener('seeked', handleSeek, { once: true })
-      })
+      await seekTo(frameNum / fps)
 
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
-      const bitmap = await new Promise<ImageBitmap>((resolve, reject) => {
-        canvas.toBlob((blob) => {
-          if (blob) {
-            createImageBitmap(blob).then(resolve).catch(reject)
-          } else {
-            reject(new Error('Failed to create blob'))
-          }
-        })
-      })
+      const bitmap = await createImageBitmapFromCanvas(canvas)
 
       const framePayload: FramePayload = {
         frameNumber: frameNum,
@@ -131,294 +273,38 @@ export async function trackHammerTrajectoryWithWorker(
 
       framesProcessed++
       onProgress((frameNum / totalFrames) * 100)
-
-      if (framesProcessed % 10 === 0) {
-        console.log(
-          `[HammerTracker] Processed ${framesProcessed} frames (${Math.round((frameNum / totalFrames) * 100)}%)`,
-        )
-      }
     }
 
-    console.log(
-      '[HammerTracker] All frames processed, detecting release/landing...',
-    )
     const result = await sendAndWait({
       type: 'detectReleaseLanding',
       payload: null,
     })
 
-    if (result.type === 'result') {
-      const payload = result.payload as TrackingResultPayload
-      console.log(
-        `[HammerTracker] Complete. Trajectory points: ${payload.trajectory.length}`,
-      )
-      return {
-        trajectory: payload.trajectory,
-        releasePoint: payload.releasePoint,
-        landingPoint: payload.landingPoint,
-        releaseFrame: payload.releaseFrame,
-      }
-    } else {
+    if (result.type !== 'result') {
       throw new Error('Failed to get tracking result from worker')
+    }
+
+    const payload = result.payload as TrackingResultPayload
+
+    const turns = analyzeTurns({
+      trajectory: payload.trajectory,
+      releaseIndex: payload.releaseFrame,
+      circleCenter,
+      scaleFactor,
+      fps,
+      frameStep,
+    })
+
+    return {
+      trajectory: payload.trajectory,
+      releasePoint: payload.releasePoint,
+      landingPoint: payload.landingPoint,
+      releaseFrame: payload.releaseFrame,
+      turns,
     }
   } finally {
     worker.terminate()
     canvas.width = 0
     canvas.height = 0
-    console.log('[HammerTracker] Worker terminated, cleanup complete')
-  }
-}
-
-export async function trackHammerTrajectory(
-  video: HTMLVideoElement,
-  fps: number,
-  onProgress: (progress: number) => void,
-): Promise<TrackingResult> {
-  console.log('[HammerTracker] Starting trajectory tracking (legacy mode)...')
-  console.log(
-    `[HammerTracker] Video: ${video.videoWidth}x${video.videoHeight}, duration: ${video.duration}s`,
-  )
-
-  await new Promise((resolve) => setTimeout(resolve, 0))
-
-  console.log('[HammerTracker] Ensuring OpenCV is loaded...')
-  await preloadOpenCV()
-  const cv = await import('@techstark/opencv-js')
-  console.log('[HammerTracker] OpenCV loaded')
-
-  const canvas = document.createElement('canvas')
-  const maxDimension = 640
-  const scale = Math.min(
-    1,
-    maxDimension / Math.max(video.videoWidth, video.videoHeight),
-  )
-  canvas.width = Math.round(video.videoWidth * scale)
-  canvas.height = Math.round(video.videoHeight * scale)
-  console.log(
-    `[HammerTracker] Processing canvas: ${canvas.width}x${canvas.height}`,
-  )
-
-  const ctx = canvas.getContext('2d')
-  if (!ctx) throw new Error('Failed to create canvas context')
-
-  const trajectory: Array<{ x: number; y: number }> = []
-  const frameStep = 6
-  const totalFrames = Math.round(video.duration * fps)
-
-  let prevFrame: InstanceType<typeof cv.Mat> | null = null
-  let prevPoints: InstanceType<typeof cv.Mat> | null = null
-
-  try {
-    let framesProcessed = 0
-    const startTime = Date.now()
-    const maxProcessingTime = 300000
-
-    for (let frameNum = 0; frameNum < totalFrames; frameNum += frameStep) {
-      if (Date.now() - startTime > maxProcessingTime) {
-        throw new Error('Video processing timeout - took longer than 5 minutes')
-      }
-
-      if (framesProcessed % 1 === 0 && framesProcessed > 0) {
-        await new Promise((resolve) => setTimeout(resolve, 10))
-      }
-      framesProcessed++
-
-      if (framesProcessed % 10 === 0) {
-        console.log(
-          `[HammerTracker] Processing frame ${framesProcessed}/${Math.ceil(totalFrames / frameStep)} (${Math.round((frameNum / totalFrames) * 100)}%)`,
-        )
-      }
-
-      const time = frameNum / fps
-      video.currentTime = time
-
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          console.error(
-            `[HammerTracker] Video seek timeout at frame ${frameNum}`,
-          )
-          reject(new Error(`Video seek timeout at frame ${frameNum}`))
-        }, 5000)
-
-        const handleSeek = () => {
-          clearTimeout(timeout)
-          resolve()
-        }
-        video.addEventListener('seeked', handleSeek, { once: true })
-      })
-
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height)
-
-      const frame = cv.matFromImageData(imageData)
-      const gray = new cv.Mat()
-
-      try {
-        cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY)
-      } catch (e) {
-        console.error(
-          `[HammerTracker] Error converting to grayscale at frame ${frameNum}:`,
-          e,
-        )
-        throw e
-      }
-
-      if (prevFrame && prevPoints) {
-        const nextPoints = new cv.Mat()
-        const status = new cv.Mat()
-        const err = new cv.Mat()
-
-        cv.calcOpticalFlowPyrLK(
-          prevFrame,
-          gray,
-          prevPoints,
-          nextPoints,
-          status,
-          err,
-          new cv.Size(21, 21),
-          3,
-        )
-
-        const goodPoints: Array<{ x: number; y: number }> = []
-        for (let i = 0; i < status.rows; i++) {
-          if (status.data[i] === 1) {
-            const x = nextPoints.data32F[i * 2]
-            const y = nextPoints.data32F[i * 2 + 1]
-            goodPoints.push({ x, y })
-          }
-        }
-
-        if (goodPoints.length > 0) {
-          const centroid = {
-            x: goodPoints.reduce((sum, p) => sum + p.x, 0) / goodPoints.length,
-            y: goodPoints.reduce((sum, p) => sum + p.y, 0) / goodPoints.length,
-          }
-          trajectory.push(centroid)
-        }
-
-        nextPoints.delete()
-        status.delete()
-        err.delete()
-      }
-
-      if (prevFrame) {
-        prevFrame.delete()
-      }
-
-      try {
-        prevFrame = gray.clone()
-        prevPoints = new cv.Mat()
-        cv.goodFeaturesToTrack(
-          gray,
-          prevPoints,
-          100,
-          0.01,
-          10,
-          new cv.Mat(),
-          3,
-          false,
-          0.04,
-        )
-      } catch (e) {
-        console.error(
-          `[HammerTracker] Error in goodFeaturesToTrack at frame ${frameNum}:`,
-          e,
-        )
-        throw e
-      }
-
-      frame.delete()
-      gray.delete()
-
-      onProgress((frameNum / totalFrames) * 100)
-    }
-
-    console.log(
-      `[HammerTracker] Processing complete. Trajectory points: ${trajectory.length}`,
-    )
-
-    const { releasePoint, landingPoint, releaseFrame } =
-      detectReleaseAndLanding(trajectory)
-
-    console.log(
-      `[HammerTracker] Release point: ${releasePoint ? 'found' : 'not found'}, Landing point: ${landingPoint ? 'found' : 'not found'}`,
-    )
-
-    const scaledTrajectory = trajectory.map((p) => ({
-      x: p.x / scale,
-      y: p.y / scale,
-    }))
-    const scaledRelease = releasePoint
-      ? { x: releasePoint.x / scale, y: releasePoint.y / scale }
-      : null
-    const scaledLanding = landingPoint
-      ? { x: landingPoint.x / scale, y: landingPoint.y / scale }
-      : null
-
-    return {
-      trajectory: scaledTrajectory,
-      releasePoint: scaledRelease,
-      landingPoint: scaledLanding,
-      releaseFrame,
-    }
-  } catch (error) {
-    console.error('[HammerTracker] Error during tracking:', error)
-    throw error
-  } finally {
-    console.log('[HammerTracker] Cleaning up...')
-    if (prevFrame) prevFrame.delete()
-    if (prevPoints) prevPoints.delete()
-    canvas.width = 0
-    canvas.height = 0
-    console.log('[HammerTracker] Cleanup complete')
-  }
-}
-
-function detectReleaseAndLanding(trajectory: Array<{ x: number; y: number }>): {
-  releasePoint: { x: number; y: number } | null
-  landingPoint: { x: number; y: number } | null
-  releaseFrame: number
-} {
-  if (trajectory.length < 10) {
-    return { releasePoint: null, landingPoint: null, releaseFrame: 0 }
-  }
-
-  const velocities: Array<number> = []
-  for (let i = 1; i < trajectory.length; i++) {
-    const dx = trajectory[i].x - trajectory[i - 1].x
-    const dy = trajectory[i].y - trajectory[i - 1].y
-    const velocity = Math.sqrt(dx * dx + dy * dy)
-    velocities.push(velocity)
-  }
-
-  let releaseIndex = 0
-  let maxVelocityIncrease = 0
-
-  for (let i = 5; i < velocities.length - 5; i++) {
-    const avgBefore = velocities.slice(i - 5, i).reduce((a, b) => a + b, 0) / 5
-    const avgAfter = velocities.slice(i, i + 5).reduce((a, b) => a + b, 0) / 5
-    const increase = avgAfter - avgBefore
-
-    if (increase > maxVelocityIncrease) {
-      maxVelocityIncrease = increase
-      releaseIndex = i
-    }
-  }
-
-  let landingIndex = trajectory.length - 1
-
-  for (let i = releaseIndex + 10; i < velocities.length - 3; i++) {
-    const avgVelocity =
-      velocities.slice(i, i + 3).reduce((a, b) => a + b, 0) / 3
-    if (avgVelocity < 2) {
-      landingIndex = i
-      break
-    }
-  }
-
-  return {
-    releasePoint: trajectory[releaseIndex] || null,
-    landingPoint: trajectory[landingIndex] || null,
-    releaseFrame: releaseIndex,
   }
 }

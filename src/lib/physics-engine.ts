@@ -11,22 +11,22 @@ interface CalculatePhysicsOptions {
   trajectory: Array<{ x: number; y: number }>
   releasePoint: { x: number; y: number }
   landingPoint: { x: number; y: number }
-  releaseFrame: number
+  releaseFrame: number // index in trajectory array
   fps: number
-  scaleFactor: number
+  frameStep: number
+  scaleFactor: number // px/m
   circleCenter: { x: number; y: number }
 }
 
 const GRAVITY = 9.81
 
-export function calculatePhysics(
-  options: CalculatePhysicsOptions,
-): PhysicsResult {
+export function calculatePhysics(options: CalculatePhysicsOptions): PhysicsResult {
   const {
     trajectory,
     landingPoint,
     releaseFrame,
     fps,
+    frameStep,
     scaleFactor,
     circleCenter,
   } = options
@@ -41,15 +41,13 @@ export function calculatePhysics(
     trajectory,
     releaseFrame,
     fps,
+    frameStep,
     scaleFactor,
   )
 
-  const predictedDistance = calculatePredictedDistance(
-    releaseVelocity,
-    releaseAngle,
-  )
+  const predictedDistance = calculatePredictedDistance(releaseVelocity, releaseAngle)
 
-  const flightTime = calculateFlightTime(trajectory, releaseFrame, fps)
+  const flightTime = calculateFlightTime(trajectory, releaseFrame, fps, frameStep)
 
   const distanceConfidence = calculateDistanceConfidence(
     trackedDistance,
@@ -80,6 +78,7 @@ function calculateReleaseMetrics(
   trajectory: Array<{ x: number; y: number }>,
   releaseFrame: number,
   fps: number,
+  frameStep: number,
   scaleFactor: number,
 ): { releaseVelocity: number; releaseAngle: number } {
   let releaseVelocity = 0
@@ -90,7 +89,7 @@ function calculateReleaseMetrics(
     const p2 = trajectory[releaseFrame + 3]
     const dx = (p2.x - p1.x) / scaleFactor
     const dy = (p2.y - p1.y) / scaleFactor
-    const dt = 3 / fps
+    const dt = (3 * frameStep) / fps
     releaseVelocity = Math.sqrt(dx * dx + dy * dy) / dt
   }
 
@@ -109,10 +108,7 @@ function calculateReleaseMetrics(
   return { releaseVelocity, releaseAngle }
 }
 
-function calculatePredictedDistance(
-  releaseVelocity: number,
-  releaseAngle: number,
-): number {
+function calculatePredictedDistance(releaseVelocity: number, releaseAngle: number) {
   if (releaseVelocity <= 0 || releaseAngle <= 0 || releaseAngle >= 90) {
     return 0
   }
@@ -128,27 +124,16 @@ function calculateFlightTime(
   trajectory: Array<{ x: number; y: number }>,
   releaseFrame: number,
   fps: number,
+  frameStep: number,
 ): number {
   if (trajectory.length <= releaseFrame + 5) {
     return 0
   }
-
-  let landingFrame = trajectory.length - 1
-  for (let i = releaseFrame + 5; i < trajectory.length - 3; i++) {
-    const yChange = trajectory[i + 3].y - trajectory[i].y
-    if (Math.abs(yChange) < 5) {
-      landingFrame = i
-      break
-    }
-  }
-
-  return (landingFrame - releaseFrame) / fps
+  const landingIndex = trajectory.length - 1
+  return ((landingIndex - releaseFrame) * frameStep) / fps
 }
 
-function calculateDistanceConfidence(
-  trackedDistance: number,
-  predictedDistance: number,
-): number {
+function calculateDistanceConfidence(trackedDistance: number, predictedDistance: number) {
   if (trackedDistance <= 0 || predictedDistance <= 0) {
     return 0
   }
