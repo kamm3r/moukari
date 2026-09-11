@@ -10,4 +10,14 @@ count.txt
 .wrangler
 .output
 .vinxi
+__unconfig*
 todos.json
+.venv/
+data/
+models/*.task
+__pycache__/
+.pytest_cache/
+test-results/
+playwright-report/
+*.mp4
+debug_frames/
